@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stream a BTCUSDT aggTrades file through the two-position legacy short strategy.
+"""Stream BTCUSDT aggTrades files through the two-position legacy short strategy.
 
 The input is the Binance USD-M Futures monthly aggTrades CSV. The initial run
 validates it and creates compact hourly and notional-volume bars; later runs
-reuse that cache and only stream the file for tick-ordered fills.
+reuse that cache and only stream the files for tick-ordered fills.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -36,7 +36,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "data" / "btcusdt" / "BTCUSDT-aggTrades-2026-08.csv"
+DEFAULT_INPUT_DIR = ROOT / "data" / "btcusdt"
 DEFAULT_OUTPUT_DIR = ROOT / "btcusdt_tick"
 UTC = timezone.utc
 REQUIRED_COLUMNS = {
@@ -48,7 +48,7 @@ REQUIRED_COLUMNS = {
     "transact_time",
     "is_buyer_maker",
 }
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 
 
 @dataclass
@@ -79,30 +79,33 @@ def as_timestamp(timestamp_ms: int) -> pd.Timestamp:
     return pd.Timestamp(timestamp_ms, unit="ms", tz="UTC")
 
 
-def iter_agg_trades(path: Path) -> Iterator[tuple[int, int, float, float, int]]:
-    """Yield (source index, agg id, price, quantity, timestamp ms)."""
-    with path.open("r", encoding="utf-8", newline="") as file:
-        reader = csv.DictReader(file)
-        if reader.fieldnames is None:
-            raise ValueError("Input CSV has no header row.")
-        missing = REQUIRED_COLUMNS.difference(reader.fieldnames)
-        if missing:
-            raise ValueError(f"Input CSV is missing columns: {sorted(missing)}")
-        for source_index, row in enumerate(reader):
-            try:
-                yield (
-                    source_index,
-                    int(row["agg_trade_id"]),
-                    float(row["price"]),
-                    float(row["quantity"]),
-                    int(row["transact_time"]),
-                )
-            except (TypeError, ValueError) as error:
-                raise ValueError(f"Invalid data at CSV row {source_index + 2}: {error}") from error
+def iter_agg_trades(paths: Sequence[Path]) -> Iterator[tuple[int, int, float, float, int]]:
+    """Yield a globally indexed, time-ordered stream from monthly aggTrades CSVs."""
+    source_index = 0
+    for path in paths:
+        with path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+            if reader.fieldnames is None:
+                raise ValueError(f"Input CSV has no header row: {path}")
+            missing = REQUIRED_COLUMNS.difference(reader.fieldnames)
+            if missing:
+                raise ValueError(f"Input CSV is missing columns in {path}: {sorted(missing)}")
+            for csv_row, row in enumerate(reader, start=2):
+                try:
+                    yield (
+                        source_index,
+                        int(row["agg_trade_id"]),
+                        float(row["price"]),
+                        float(row["quantity"]),
+                        int(row["transact_time"]),
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"Invalid data in {path} at CSV row {csv_row}: {error}") from error
+                source_index += 1
 
 
 def first_pass(
-    input_path: Path,
+    input_paths: Sequence[Path],
     volume_bar_notional: float,
     max_gap_seconds: float,
     progress_rows: int,
@@ -124,7 +127,7 @@ def first_pass(
     rows = 0
     max_gap_ms = int(max_gap_seconds * 1000)
 
-    for tick_id, agg_id, price, quantity, timestamp_ms in iter_agg_trades(input_path):
+    for tick_id, agg_id, price, quantity, timestamp_ms in iter_agg_trades(input_paths):
         if not math.isfinite(price) or not math.isfinite(quantity) or price <= 0 or quantity <= 0:
             raise ValueError(f"Invalid non-positive price or quantity at {timestamp_text(timestamp_ms)}")
         if last_agg_id is not None and agg_id <= last_agg_id:
@@ -236,20 +239,21 @@ def first_pass(
         raise ValueError("No completed notional-volume bars were generated.")
     return hourly, volume_bars, {
         "rows": rows,
+        "input_files": [str(path) for path in input_paths],
         "first_timestamp": hourly_records[0]["hour_start"].isoformat(),
         "last_timestamp": as_timestamp(last_timestamp_ms).isoformat(),
         "volume_bars": len(volume_bars),
     }
 
 
-def preprocessing_cache_metadata(input_path: Path, args: argparse.Namespace) -> dict[str, object]:
+def preprocessing_cache_metadata(input_paths: Sequence[Path], args: argparse.Namespace) -> dict[str, object]:
     """Return every source property that changes the compact bar cache."""
-    stat = input_path.stat()
     return {
         "cache_format_version": CACHE_FORMAT_VERSION,
-        "input_path": str(input_path),
-        "input_size_bytes": stat.st_size,
-        "input_modified_ns": stat.st_mtime_ns,
+        "inputs": [
+            {"path": str(path), "size_bytes": path.stat().st_size, "modified_ns": path.stat().st_mtime_ns}
+            for path in input_paths
+        ],
         "volume_bar_notional": args.volume_bar_notional,
         "max_gap_seconds": args.max_gap_seconds,
     }
@@ -257,7 +261,7 @@ def preprocessing_cache_metadata(input_path: Path, args: argparse.Namespace) -> 
 
 def cache_paths(cache_dir: Path, metadata: dict[str, object]) -> tuple[Path, Path, Path]:
     fingerprint = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    prefix = f"BTCUSDT-aggTrades-2026-08-{fingerprint}"
+    prefix = f"BTCUSDT-aggTrades-{fingerprint}"
     return (
         cache_dir / f"{prefix}.metadata.json",
         cache_dir / f"{prefix}.hourly.pkl",
@@ -266,12 +270,12 @@ def cache_paths(cache_dir: Path, metadata: dict[str, object]) -> tuple[Path, Pat
 
 
 def load_or_build_preprocessing(
-    input_path: Path, args: argparse.Namespace
+    input_paths: Sequence[Path], args: argparse.Namespace
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Reuse validated compact bars when the source file and validation settings match."""
-    metadata = preprocessing_cache_metadata(input_path, args)
+    metadata = preprocessing_cache_metadata(input_paths, args)
     if args.cache_dir is None:
-        cache_dir = input_path.parent / ".backtest_cache"
+        cache_dir = input_paths[0].parent / ".backtest_cache"
     else:
         cache_dir = args.cache_dir.resolve()
     metadata_path, hourly_path, volume_path = cache_paths(cache_dir, metadata)
@@ -290,7 +294,7 @@ def load_or_build_preprocessing(
 
     print("no matching preprocessing cache; validating and building compact bars")
     hourly, volume_bars, first_summary = first_pass(
-        input_path, args.volume_bar_notional, args.max_gap_seconds, args.progress_rows
+        input_paths, args.volume_bar_notional, args.max_gap_seconds, args.progress_rows
     )
     first_summary["hourly_bars"] = len(hourly)
     if not args.no_cache:
@@ -422,7 +426,7 @@ def close_group(
 
 
 def second_pass(
-    input_path: Path,
+    input_paths: Sequence[Path],
     hourly: pd.DataFrame,
     signal_bars: pd.DataFrame,
     args: argparse.Namespace,
@@ -462,7 +466,7 @@ def second_pass(
     exposure_ms = defaultdict(int)
     next_sample_ms: int | None = None
 
-    for tick_id, _agg_id, price, _quantity, timestamp_ms in iter_agg_trades(input_path):
+    for tick_id, _agg_id, price, _quantity, timestamp_ms in iter_agg_trades(input_paths):
         if last_timestamp_ms is not None:
             exposure_ms[previous_exposure] += timestamp_ms - last_timestamp_ms
         last_timestamp_ms, last_price = timestamp_ms, price
@@ -736,9 +740,11 @@ def write_chart(
 
 
 def write_report(path: Path, args: argparse.Namespace, first_summary: dict[str, object], summary: dict[str, object]) -> None:
+    input_files = "\n".join(f"  - `{input_path}`" for input_path in first_summary["input_files"])
     text = f"""# BTCUSDT aggTrades two-position legacy short backtest
 
-- Input: `{args.input}`
+- Inputs:
+{input_files}
 - Source rows: {first_summary['rows']:,}; completed hourly bars: {first_summary['hourly_bars']:,}; completed notional-volume bars: {first_summary['volume_bars']:,}.
 - Period: {first_summary['first_timestamp']} to {first_summary['last_timestamp']}.
 - Continuous 24/7 market. Volume bar threshold: US${args.volume_bar_notional:,.0f}; max permitted data gap: {args.max_gap_seconds:g} seconds.
@@ -766,7 +772,16 @@ def write_report(path: Path, args: argparse.Namespace, first_summary: dict[str, 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "One or more monthly aggTrades CSV files or directories. Directories are expanded "
+            "to BTCUSDT-aggTrades-YYYY-MM.csv files. Defaults to every matching CSV in data/btcusdt."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--cache-dir", type=Path, help="Directory for validated compact-bar caches (default: input/.backtest_cache).")
     parser.add_argument("--refresh-cache", action="store_true", help="Revalidate the input and replace its preprocessing cache.")
@@ -809,28 +824,55 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def resolve_input_paths(raw_inputs: Sequence[Path] | None) -> list[Path]:
+    """Resolve CSV files and directories into chronological monthly input files."""
+    candidates = raw_inputs if raw_inputs is not None else [DEFAULT_INPUT_DIR]
+    paths: list[Path] = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_dir():
+            paths.extend(sorted(candidate.glob("BTCUSDT-aggTrades-????-??.csv")))
+        elif candidate.is_file():
+            paths.append(candidate)
+        else:
+            raise SystemExit(f"Error: input path does not exist: {candidate}")
+    paths = sorted(set(paths))
+    if not paths:
+        raise SystemExit(
+            "Error: no BTCUSDT-aggTrades-YYYY-MM.csv files were found. "
+            "Pass one or more files with --input."
+        )
+    return paths
+
+
+def output_stem(input_paths: Sequence[Path]) -> str:
+    """Create a concise, range-specific name for generated backtest artifacts."""
+    months = [path.stem.removeprefix("BTCUSDT-aggTrades-") for path in input_paths]
+    period = months[0] if len(months) == 1 else f"{months[0]}_to_{months[-1]}"
+    return f"BTCUSDT_{period}"
+
+
 def main() -> None:
     args = parse_args()
-    args.input = args.input.resolve()
-    if not args.input.is_file():
-        raise SystemExit(f"Error: input file does not exist: {args.input}")
+    input_paths = resolve_input_paths(args.input)
     args.output_dir = args.output_dir.resolve()
-    hourly, volume_bars, first_summary = load_or_build_preprocessing(args.input, args)
+    hourly, volume_bars, first_summary = load_or_build_preprocessing(input_paths, args)
     hourly, signal_bars, zones = build_indicators(hourly, volume_bars, args)
     print(f"first pass complete: hourly_bars={len(hourly):,} volume_bars={len(signal_bars):,}")
-    contracts, groups, samples, summary = second_pass(args.input, hourly, signal_bars, args)
+    contracts, groups, samples, summary = second_pass(input_paths, hourly, signal_bars, args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    contracts.to_csv(args.output_dir / "BTCUSDT_2026-08_contract_trades.csv", index=False, encoding="utf-8-sig")
-    groups.to_csv(args.output_dir / "BTCUSDT_2026-08_group_trades.csv", index=False, encoding="utf-8-sig")
-    samples.to_csv(args.output_dir / "BTCUSDT_2026-08_equity_samples.csv", index=False, encoding="utf-8-sig")
+    stem = output_stem(input_paths)
+    contracts.to_csv(args.output_dir / f"{stem}_contract_trades.csv", index=False, encoding="utf-8-sig")
+    groups.to_csv(args.output_dir / f"{stem}_group_trades.csv", index=False, encoding="utf-8-sig")
+    samples.to_csv(args.output_dir / f"{stem}_equity_samples.csv", index=False, encoding="utf-8-sig")
     write_chart(
-        args.output_dir / "BTCUSDT_2026-08_two_position_legacy_exit.html",
+        args.output_dir / f"{stem}_two_position_legacy_exit.html",
         zones,
         contracts,
         samples,
         args.initial_equity_usdt,
     )
-    write_report(ROOT / "doc" / "btcusdt_2026-08_two_position_legacy_exit.md", args, first_summary, summary)
+    write_report(ROOT / "doc" / f"{stem.lower()}_two_position_legacy_exit.md", args, first_summary, summary)
     print(f"contracts={summary['contract_trades']} groups={summary['groups']} net_pnl_usdt={summary['net_pnl_usdt']:.2f}")
 
 
