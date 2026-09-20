@@ -62,6 +62,13 @@ class OpenLot:
     resistance_top: float
     lowest_price: float
     highest_price: float
+    signal_type: str = "resistance_reversal"
+    zone_type: str = "resistance"
+    zone_bottom: float = np.nan
+    zone_top: float = np.nan
+    initial_stop: float = np.nan
+    target_price: float = np.nan
+    risk_points: float = np.nan
 
 
 CONTRACT_COLUMNS = [
@@ -69,7 +76,9 @@ CONTRACT_COLUMNS = [
     "exit_session", "raw_entry_price", "entry_fill_price", "raw_exit_price", "exit_fill_price",
     "entry_layer", "signal_tick_end_id", "signal_open", "signal_high", "signal_low", "signal_close", "signal_volume",
     "signal_close_position", "resistance_id", "resistance_bottom", "resistance_top", "gross_points", "net_points", "gross_ntd",
-    "net_ntd", "mfe_points", "mae_points", "holding_hours", "exit_reason", "cross_session",
+    "net_ntd", "mfe_points", "mae_points", "holding_hours", "exit_reason", "cross_session", "signal_type",
+    "zone_type", "zone_bottom", "zone_top", "initial_stop", "target_price", "risk_points", "r_multiple",
+    "scale_in_time",
     "cumulative_net_ntd",
 ]
 
@@ -94,6 +103,8 @@ def add_optimized_layer_signals(
     hourly: pd.DataFrame,
     zones: pd.DataFrame,
     close_position_max: float,
+    breakout_buffer_atr: float = 0.10,
+    rejection_timeout_bars: int = 3,
 ) -> pd.DataFrame:
     """Create causal Early, Balanced, and Conservative resistance entries.
 
@@ -111,6 +122,12 @@ def add_optimized_layer_signals(
         & (result["close_position"] <= close_position_max)
     )
     result = assign_resistance_entries(result, zones)
+    for column, default in {
+        "signal_type": pd.NA, "zone_type": pd.NA, "zone_id": pd.NA,
+        "zone_bottom": np.nan, "zone_top": np.nan, "breakout_confirmed": False,
+        "rejection_low": np.nan, "rejection_high": np.nan,
+    }.items():
+        result[column] = default
     result["entry_layer"] = pd.NA
     result["resistance_reversal"] = False
     resistances = zones[zones["zone_type"] == "resistance"] if not zones.empty else zones
@@ -120,6 +137,9 @@ def add_optimized_layer_signals(
         hourly_rows = list(session_hourly.itertuples(index=False))
         hourly_index = -1
         setup: dict[str, object] | None = None
+        pending_rejections: list[dict[str, object]] = []
+        previous_close: float | None = None
+        support_signalled: set[int] = set()
 
         for index, bar in session_bars.sort_values("tick_end_id", kind="stable").iterrows():
             while hourly_index + 1 < len(hourly_rows) and hourly_rows[hourly_index + 1].timestamp < bar["timestamp"]:
@@ -147,26 +167,74 @@ def add_optimized_layer_signals(
                         setup["balanced_armed"] = True
                     setup["peak_high"] = max(previous_peak, float(hour.high))
 
-            if setup is None or pd.isna(bar["resistance_id"]):
-                continue
-            if int(bar["resistance_id"]) != int(setup["resistance_id"]):
-                continue
+            # A bearish resistance touch becomes a rejection candidate.  Entry
+            # requires a later completed volume bar to break its low.
+            if not pd.isna(bar["resistance_id"]):
+                rid = int(bar["resistance_id"])
+                pending_rejections.append({
+                    "zone_id": rid, "bottom": float(bar["resistance_bottom"]),
+                    "top": float(bar["resistance_top"]), "low": float(bar["low"]),
+                    "high": float(bar["high"]), "age": 0,
+                })
 
-            stage = int(setup["stage"])
-            layer: str | None = None
-            if stage == 0:
-                layer = "early"
-                setup["stage"] = 1
-            elif stage == 1 and bool(setup["balanced_armed"]) and float(bar["high"]) < float(setup["peak_high"]):
-                layer = "balanced"
-                setup["stage"] = 2
-            elif stage == 2 and float(bar["close"]) < float(bar["resistance_bottom"]):
-                layer = "conservative"
-                setup["stage"] = 3
+            atr_value = np.nan
+            if hourly_rows:
+                prior_hours = [h for h in hourly_rows if h.timestamp < bar["timestamp"]]
+                if prior_hours and hasattr(prior_hours[-1], "atr"):
+                    atr_value = float(prior_hours[-1].atr)
+            buffer = 0.0 if pd.isna(atr_value) else breakout_buffer_atr * atr_value
 
-            if layer is not None:
-                result.at[index, "entry_layer"] = layer
+            # Confirm a rejection only once, and expire stale candidates.
+            confirmed = None
+            for rejection in pending_rejections:
+                rejection["age"] = int(rejection["age"]) + 1
+                if float(bar["close"]) < float(rejection["low"]) - buffer:
+                    confirmed = rejection
+                    break
+            pending_rejections = [r for r in pending_rejections if int(r["age"]) <= rejection_timeout_bars]
+            if confirmed is not None:
+                result.at[index, "entry_layer"] = "confirmed_reversal"
                 result.at[index, "resistance_reversal"] = True
+                result.at[index, "signal_type"] = "resistance_reversal"
+                result.at[index, "zone_type"] = "resistance"
+                result.at[index, "zone_id"] = int(confirmed["zone_id"])
+                result.at[index, "zone_bottom"] = float(confirmed["bottom"])
+                result.at[index, "zone_top"] = float(confirmed["top"])
+                result.at[index, "rejection_low"] = float(confirmed["low"])
+                result.at[index, "rejection_high"] = float(confirmed["high"])
+                pending_rejections = [r for r in pending_rejections if r is not confirmed]
+
+            # A support breakdown is a close-through event, not a touch.
+            supports = zones[zones["zone_type"] == "support"] if not zones.empty else zones
+            if previous_close is not None and not supports.empty:
+                candidates = supports[
+                    (supports["created_time"] < bar["timestamp"])
+                    & (supports["top"] >= float(bar["low"]))
+                    & (supports["bottom"] <= float(bar["high"]))
+                    & (supports["broken_time"].isna() | (bar["timestamp"] <= supports["broken_time"]))
+                ]
+                if not candidates.empty:
+                    selected = candidates.sort_values("top", ascending=False).iloc[0]
+                    sid = int(selected["zone_id"])
+                    atr_buffer = 0.0 if pd.isna(atr_value) else breakout_buffer_atr * atr_value
+                    if (
+                        sid not in support_signalled
+                        and previous_close >= float(selected["bottom"])
+                        and float(bar["close"]) < float(selected["bottom"]) - atr_buffer
+                        and bool(bar["bearish_rejection"])
+                    ):
+                        support_signalled.add(sid)
+                        result.at[index, "entry_layer"] = "breakdown"
+                        result.at[index, "resistance_reversal"] = True
+                        result.at[index, "signal_type"] = "support_breakdown"
+                        result.at[index, "zone_type"] = "support"
+                        result.at[index, "zone_id"] = sid
+                        result.at[index, "zone_bottom"] = float(selected["bottom"])
+                        result.at[index, "zone_top"] = float(selected["top"])
+                        result.at[index, "breakout_confirmed"] = True
+                        result.at[index, "rejection_low"] = float(bar["low"])
+                        result.at[index, "rejection_high"] = float(bar["high"])
+            previous_close = float(bar["close"])
 
     return result
 
@@ -219,6 +287,15 @@ def _close_group(
                 "holding_hours": (tick.timestamp - lot.entry_time).total_seconds() / 3600,
                 "exit_reason": reason,
                 "cross_session": lot.entry_session != tick.session_id,
+                "signal_type": lot.signal_type,
+                "zone_type": lot.zone_type,
+                "zone_bottom": lot.zone_bottom,
+                "zone_top": lot.zone_top,
+                "initial_stop": lot.initial_stop,
+                "target_price": lot.target_price,
+                "risk_points": lot.risk_points,
+                "r_multiple": net_points / lot.risk_points if lot.risk_points > 0 else np.nan,
+                "scale_in_time": pd.NaT,
             }
         )
 
@@ -257,6 +334,11 @@ def backtest_two_position_short(
     point_value_ntd: float = 10.0,
     slippage_points: float = 2.0,
     chart_sample_minutes: int = 5,
+    stop_buffer_atr: float = 0.25,
+    trail_atr_multiplier: float = 1.0,
+    scale_in_min_r: float = 0.5,
+    confirmation_timeout_hours: float = 12.0,
+    maximum_holding_hours: float = 24.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Run tick fills, two-lot scaling, a shared Supertrend exit, and account MTM."""
     if initial_capital_ntd <= 0 or max_positions < 1 or point_value_ntd <= 0:
@@ -271,6 +353,7 @@ def backtest_two_position_short(
         .sort_values("timestamp", kind="stable")
         .itertuples(index=False)
     )
+    atr_rows = list(hourly.sort_values("timestamp", kind="stable").itertuples(index=False))
     hourly_index = -1
     current_direction: int | None = None
     group_last_direction: int | None = None
@@ -278,6 +361,7 @@ def backtest_two_position_short(
     next_group_id = 0
     positions: list[OpenLot] = []
     pending_entry: object | None = None
+    pending_scale_in: object | None = None
     contract_records: list[dict[str, object]] = []
     group_records: list[dict[str, object]] = []
     equity_samples: list[dict[str, object]] = []
@@ -303,6 +387,7 @@ def backtest_two_position_short(
         previous_time = tick.timestamp
 
         bullish_flip = False
+        current_atr = np.nan
         while hourly_index + 1 < len(hourly_rows) and hourly_rows[hourly_index + 1].timestamp < tick.timestamp:
             hourly_index += 1
             direction_value = hourly_rows[hourly_index].supertrend_direction
@@ -314,6 +399,9 @@ def backtest_two_position_short(
                     bullish_flip = True
                 group_last_direction = new_direction
             current_direction = new_direction
+        prior_atr = [row for row in atr_rows if row.timestamp < tick.timestamp]
+        if prior_atr and hasattr(prior_atr[-1], "atr") and not pd.isna(prior_atr[-1].atr):
+            current_atr = float(prior_atr[-1].atr)
 
         exited_this_tick = False
         if positions and bullish_flip:
@@ -325,6 +413,7 @@ def backtest_two_position_short(
             realized_ntd += group_net
             positions = []
             pending_entry = None
+            pending_scale_in = None
             group_last_direction = None
             group_seen_bearish = False
             exited_this_tick = True
@@ -332,12 +421,26 @@ def backtest_two_position_short(
         if not exited_this_tick and pending_entry is not None:
             signal = pending_entry
             pending_entry = None
-            if tick.session_id == signal.session_id and len(positions) < max_positions:
+            if tick.session_id == signal.session_id and len(positions) < max_positions and current_direction == -1:
                 if not positions:
                     next_group_id += 1
                     group_last_direction = current_direction
                     group_seen_bearish = current_direction == -1
                 raw_entry = float(tick.price)
+                atr = 0.0 if pd.isna(current_atr) else current_atr
+                signal_type = str(getattr(signal, "signal_type", "resistance_reversal"))
+                zone_type = str(getattr(signal, "zone_type", "resistance"))
+                zone_bottom = float(getattr(signal, "zone_bottom", getattr(signal, "resistance_bottom", np.nan)))
+                zone_top = float(getattr(signal, "zone_top", getattr(signal, "resistance_top", np.nan)))
+                signal_high = float(signal.high)
+                if signal_type == "support_breakdown":
+                    initial_stop = max(signal_high, zone_bottom) + stop_buffer_atr * atr
+                else:
+                    initial_stop = max(signal_high, zone_top) + stop_buffer_atr * atr
+                risk_points = max(0.0, initial_stop - raw_entry)
+                target_price = np.nan
+                if risk_points > 0:
+                    target_price = raw_entry - risk_points
                 positions.append(
                     OpenLot(
                         group_id=next_group_id,
@@ -355,22 +458,88 @@ def backtest_two_position_short(
                         signal_close=float(signal.close),
                         signal_volume=float(signal.volume),
                         signal_close_position=float(signal.close_position),
-                        resistance_id=int(signal.resistance_id),
-                        resistance_bottom=float(signal.resistance_bottom),
-                        resistance_top=float(signal.resistance_top),
+                        resistance_id=int(getattr(signal, "zone_id", getattr(signal, "resistance_id", -1))),
+                        resistance_bottom=zone_bottom,
+                        resistance_top=zone_top,
                         lowest_price=raw_entry,
                         highest_price=raw_entry,
-                    )
+                        signal_type=signal_type,
+                        zone_type=zone_type,
+                        zone_bottom=zone_bottom,
+                        zone_top=zone_top,
+                        initial_stop=initial_stop,
+                        target_price=target_price,
+                        risk_points=risk_points,
+                )
                 )
                 filled_entries += 1
                 peak_positions = max(peak_positions, len(positions))
             else:
                 canceled_session += 1
 
+        # Scale in only after the first lot has achieved the configured R and
+        # a fresh signal confirms a failed retest of the same zone.
+        if not exited_this_tick and pending_scale_in is not None and len(positions) == 1:
+            signal = pending_scale_in
+            pending_scale_in = None
+            first = positions[0]
+            favorable_r = (first.entry_fill_price - float(tick.price)) / first.risk_points if first.risk_points > 0 else 0.0
+            if tick.session_id == signal.session_id and favorable_r >= scale_in_min_r:
+                raw_entry = float(tick.price)
+                positions.append(OpenLot(
+                    group_id=first.group_id, slot=2, signal_time=signal.timestamp,
+                    entry_time=tick.timestamp, entry_session=tick.session_id,
+                    raw_entry_price=raw_entry, entry_fill_price=raw_entry - slippage_points,
+                    entry_layer=str(getattr(signal, "entry_layer", "scale_in")),
+                    signal_tick_end_id=int(signal.tick_end_id), signal_open=float(signal.open),
+                    signal_high=float(signal.high), signal_low=float(signal.low), signal_close=float(signal.close),
+                    signal_volume=float(signal.volume), signal_close_position=float(signal.close_position),
+                    resistance_id=int(getattr(signal, "zone_id", getattr(signal, "resistance_id", -1))),
+                    resistance_bottom=float(getattr(signal, "zone_bottom", getattr(signal, "resistance_bottom", np.nan))),
+                    resistance_top=float(getattr(signal, "zone_top", getattr(signal, "resistance_top", np.nan))),
+                    lowest_price=raw_entry, highest_price=raw_entry,
+                    signal_type=str(getattr(signal, "signal_type", first.signal_type)), zone_type=first.zone_type,
+                    zone_bottom=first.zone_bottom, zone_top=first.zone_top,
+                    initial_stop=first.initial_stop, target_price=first.target_price,
+                    risk_points=first.risk_points,
+                ))
+                filled_entries += 1
+
         price = float(tick.price)
         for lot in positions:
             lot.lowest_price = min(lot.lowest_price, price)
             lot.highest_price = max(lot.highest_price, price)
+
+        if positions:
+            first = positions[0]
+            if not pd.isna(current_atr):
+                for lot in positions:
+                    if lot.risk_points > 0 and lot.lowest_price <= lot.entry_fill_price - scale_in_min_r * lot.risk_points:
+                        trail = lot.lowest_price + trail_atr_multiplier * current_atr
+                        lot.initial_stop = min(lot.initial_stop, trail)
+            stop_hit = any(price >= lot.initial_stop for lot in positions if not pd.isna(lot.initial_stop))
+            target_hit = len(positions) >= 1 and not pd.isna(first.target_price) and price <= first.target_price
+            timeout = tick.timestamp - first.entry_time >= pd.Timedelta(hours=maximum_holding_hours)
+            no_confirmation = (
+                tick.timestamp - first.entry_time >= pd.Timedelta(hours=confirmation_timeout_hours)
+                and first.lowest_price > first.entry_fill_price - scale_in_min_r * first.risk_points
+            )
+            if stop_hit:
+                records, group_record, group_net = _close_group(positions, tick, "initial_structure_stop", slippage_points, point_value_ntd)
+                contract_records.extend(records); group_records.append(group_record); realized_ntd += group_net
+                positions = []; pending_entry = None; pending_scale_in = None; exited_this_tick = True
+            elif target_hit and len(positions) == 1:
+                records, group_record, group_net = _close_group(positions, tick, "one_r_target", slippage_points, point_value_ntd)
+                contract_records.extend(records); group_records.append(group_record); realized_ntd += group_net
+                positions = []; pending_entry = None; pending_scale_in = None; exited_this_tick = True
+            elif timeout:
+                records, group_record, group_net = _close_group(positions, tick, "maximum_holding_time", slippage_points, point_value_ntd)
+                contract_records.extend(records); group_records.append(group_record); realized_ntd += group_net
+                positions = []; pending_entry = None; pending_scale_in = None; exited_this_tick = True
+            elif no_confirmation:
+                records, group_record, group_net = _close_group(positions, tick, "confirmation_timeout", slippage_points, point_value_ntd)
+                contract_records.extend(records); group_records.append(group_record); realized_ntd += group_net
+                positions = []; pending_entry = None; pending_scale_in = None; exited_this_tick = True
 
         completed_bar = completed_bars.get(int(tick.tick_id))
         if completed_bar is not None and bool(completed_bar.resistance_reversal):
@@ -380,7 +549,17 @@ def backtest_two_position_short(
             elif len(positions) >= max_positions:
                 ignored_at_capacity += 1
             elif pending_entry is None:
-                pending_entry = completed_bar
+                same_zone = (
+                    len(positions) == 1
+                    and not pd.isna(getattr(completed_bar, "zone_id", np.nan))
+                    and int(completed_bar.zone_id) == positions[0].resistance_id
+                )
+                if same_zone:
+                    pending_scale_in = completed_bar
+                elif not positions:
+                    pending_entry = completed_bar
+                else:
+                    ignored_at_capacity += 1
 
         unrealized_ntd = sum((lot.entry_fill_price - price) * point_value_ntd for lot in positions)
         equity = initial_capital_ntd + realized_ntd + unrealized_ntd
@@ -525,11 +704,11 @@ def write_report(
 
 ## 交易規則
 
-- 完整小時 K 確認碰到有效壓力後啟動分層進場；量 K 必須接觸該壓力、收黑，且收盤位置不高於 {args.close_position_max:.0%}。
-- `Early` 是確認後第一個合格反轉；之後完整小時 K 若形成更高測試點，第一個 lower-high 合格反轉為 `Balanced`；再往後首次收回壓力下緣為 `Conservative`。
-- 訊號後同一交易時段的下一筆 tick 放空一口；持有一口時，下個有效訊號再加一口，滿兩口後忽略其他訊號。
-- 兩口視為同一組。自適應 60 分 Supertrend 曾呈空頭後翻多，於第一筆可用 tick 同時平倉。
-- 不設初始停損、移動停利、保本、壓力失效、確認逾時或最大持倉時間；資料結束時以最後 tick 平倉。
+- 60 分鐘 K 建立支撐／壓力箱；2,000 口量 K 判定訊號，訊號完成後同交易時段下一筆 tick 放空。
+- 壓力反轉需先形成收黑 rejection K，再由後續量 K 跌破 rejection 低點；支撐跌破需收盤有效跌破箱底。
+- 只在 60 分鐘 Supertrend 為空頭時進場；首口確認後，同箱體回測失敗且至少達 {args.scale_in_min_r:.1f}R 才允許第二口。
+- 使用箱體失效位置加 {args.stop_buffer_atr:g} ATR 初始停損，並在達到確認獲利後使用 {args.trail_atr_multiplier:g} ATR 移動停損。
+- 首口以 1R 目標出場；另設 {args.confirmation_timeout_hours:g} 小時確認逾時與 {args.maximum_holding_hours:g} 小時最大持倉時間。
 - 60 分狀態只在其完成時間嚴格早於當前 tick 時使用，保留同秒成交的原始列順序。
 
 ## 帳戶結果
@@ -562,7 +741,7 @@ def write_report(
 
 ## 風險說明
 
-本版本依選定的 Legacy 行為，不會在獲利時移動停損，也沒有虧損上限。NT$400,000 僅作為權益基準；回測不會因權益或保證金不足自動平倉。
+NT$400,000 僅作為權益基準；回測不會因權益或保證金不足自動平倉。
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -640,6 +819,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-bar-size", type=float, default=2000)
     parser.add_argument("--tick-lookback", type=int, default=5)
     parser.add_argument("--close-position-max", type=float, default=0.35)
+    parser.add_argument("--breakout-buffer-atr", type=float, default=0.10)
+    parser.add_argument("--stop-buffer-atr", type=float, default=0.25)
+    parser.add_argument("--rejection-timeout-bars", type=int, default=3)
+    parser.add_argument("--scale-in-min-r", type=float, default=0.5)
+    parser.add_argument("--trail-atr-multiplier", type=float, default=1.0)
+    parser.add_argument("--confirmation-timeout-hours", type=float, default=12.0)
+    parser.add_argument("--maximum-holding-hours", type=float, default=24.0)
     parser.add_argument("--pivot-lookback", type=int, default=20)
     parser.add_argument("--volume-filter-length", type=int, default=2)
     parser.add_argument("--zone-atr-length", type=int, default=20)
@@ -668,6 +854,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("capital, position count, bar sizes, and lookbacks must be positive")
     if args.slippage_points < 0 or args.zone_box_width < 0:
         parser.error("slippage and zone width must be non-negative")
+    if min(args.breakout_buffer_atr, args.stop_buffer_atr, args.scale_in_min_r,
+           args.trail_atr_multiplier, args.confirmation_timeout_hours,
+           args.maximum_holding_hours) <= 0 or args.rejection_timeout_bars < 1:
+        parser.error("risk buffers, timeouts, and scale-in thresholds must be positive")
     if not 0 < args.close_position_max <= 1:
         parser.error("--close-position-max must be in (0, 1]")
     if not 0 < args.min_multiplier <= args.base_multiplier:
@@ -692,10 +882,15 @@ def main() -> None:
         hourly, args.pivot_lookback, args.volume_filter_length, args.zone_atr_length, args.zone_box_width
     )
     signal_bars = build_session_volume_bars(ticks, args.volume_bar_size)
-    signal_bars = add_optimized_layer_signals(signal_bars, hourly, zones, args.close_position_max)
+    signal_bars = add_optimized_layer_signals(
+        signal_bars, hourly, zones, args.close_position_max,
+        args.breakout_buffer_atr, args.rejection_timeout_bars,
+    )
     contracts, groups, samples, summary = backtest_two_position_short(
         ticks, signal_bars, hourly, args.initial_capital_ntd, args.max_positions, args.point_value_ntd,
         args.slippage_points, args.chart_sample_minutes,
+        args.stop_buffer_atr, args.trail_atr_multiplier, args.scale_in_min_r,
+        args.confirmation_timeout_hours, args.maximum_holding_hours,
     )
     for output in (args.contract_trades_output, args.group_trades_output):
         output.parent.mkdir(parents=True, exist_ok=True)
