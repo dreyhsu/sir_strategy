@@ -9,45 +9,46 @@
 
 ## 交易規則
 
-- 完整小時 K 確認碰到有效壓力後啟動分層進場；量 K 必須接觸該壓力、收黑，且收盤位置不高於 35%。
-- `Early` 是確認後第一個合格反轉；之後完整小時 K 若形成更高測試點，第一個 lower-high 合格反轉為 `Balanced`；再往後首次收回壓力下緣為 `Conservative`。
-- 訊號後同一交易時段的下一筆 tick 放空一口；持有一口時，下個有效訊號再加一口，滿兩口後忽略其他訊號。
-- 兩口視為同一組。自適應 60 分 Supertrend 曾呈空頭後翻多，於第一筆可用 tick 同時平倉。
-- 不設初始停損、移動停利、保本、壓力失效、確認逾時或最大持倉時間；資料結束時以最後 tick 平倉。
+- 60 分鐘 K 建立支撐／壓力箱；2,000 口量 K 判定訊號，訊號完成後同交易時段下一筆 tick 放空。
+- 壓力反轉需先形成收黑 rejection K，再由後續量 K 跌破 rejection 低點；支撐跌破需收盤有效跌破箱底。
+- 只在 60 分鐘 Supertrend 為空頭時進場；首口確認後，同箱體回測失敗且至少達 0.5R 才允許第二口。
+- 使用箱體失效位置加 0.25 ATR 初始停損，並在達到確認獲利後使用 1 ATR 移動停損。
+- 首口以 1R 目標出場；另設 12 小時確認逾時與 24 小時最大持倉時間。
 - 60 分狀態只在其完成時間嚴格早於當前 tick 時使用，保留同秒成交的原始列順序。
 
 ## 帳戶結果
 
 | Metric | Value |
 | --- | ---: |
-| Valid signals / filled entries | 19 / 10 |
-| Ignored at two-contract capacity | 9 |
-| Contract trades / position groups | 10 / 5 |
-| Winning / losing contracts | 8 / 2 |
-| Winning / losing groups | 4 / 1 |
-| Contract / group win rate | 80.0% / 80.0% |
-| Group profit factor | 2.47 |
-| Gross P&L | NT$23,490 |
-| Net P&L after slippage | NT$23,090 |
-| Final equity | NT$423,090 |
-| Return | 5.77% |
-| Minimum tick-level equity | NT$374,840 |
-| Maximum tick-level drawdown | NT$29,340 (7.26%) |
-| Peak open contracts | 2 |
-| Flat exposure | 634.8 h (63.6%) |
-| One-contract exposure | 63.6 h (6.4%) |
-| Two-contract exposure | 299.6 h (30.0%) |
+| Valid signals / filled entries | 108 / 7 |
+| Ignored at two-contract capacity | 3 |
+| Contract trades / position groups | 7 / 6 |
+| Winning / losing contracts | 2 / 5 |
+| Winning / losing groups | 2 / 4 |
+| Contract / group win rate | 28.6% / 33.3% |
+| Group profit factor | 0.35 |
+| Gross P&L | NT$-3,470 |
+| Net P&L after slippage | NT$-3,750 |
+| Final equity | NT$396,250 |
+| Return | -0.94% |
+| Minimum tick-level equity | NT$394,650 |
+| Maximum tick-level drawdown | NT$7,420 (1.85%) |
+| Peak open contracts | 1 |
+| Flat exposure | 987.7 h (99.0%) |
+| One-contract exposure | 10.1 h (1.0%) |
+| Two-contract exposure | 0.2 h (0.0%) |
 
 ## Group Ledger
 
 | Group | Lots | First entry | Exit | Average fill | Net NTD | Exit reason |
 |---:|---:|---|---|---:|---:|---|
-| 1 | 2 | 2026-08-11 20:25:54 | 2026-08-17 12:45:01 | 45453.0 | -15,660 | adaptive_hourly_supertrend_bullish_flip |
-| 2 | 2 | 2026-08-27 09:57:38 | 2026-08-28 00:00:00 | 46384.5 | 550 | adaptive_hourly_supertrend_bullish_flip |
-| 3 | 2 | 2026-08-28 00:18:20 | 2026-08-31 15:00:00 | 46405.0 | 6,000 | adaptive_hourly_supertrend_bullish_flip |
-| 4 | 2 | 2026-09-05 01:01:05 | 2026-09-08 18:00:00 | 47286.5 | 8,370 | adaptive_hourly_supertrend_bullish_flip |
-| 5 | 2 | 2026-09-09 09:51:12 | 2026-09-10 23:00:00 | 47514.5 | 23,830 | adaptive_hourly_supertrend_bullish_flip |
+| 1 | 1 | 2026-08-18 22:55:00 | 2026-08-19 03:27:20 | 44626.0 | -630 | initial_structure_stop |
+| 2 | 1 | 2026-08-27 17:04:31 | 2026-08-27 22:13:41 | 46314.0 | 1,120 | initial_structure_stop |
+| 3 | 1 | 2026-09-01 09:02:48 | 2026-09-01 09:08:43 | 46296.0 | -2,880 | initial_structure_stop |
+| 4 | 1 | 2026-09-01 09:11:34 | 2026-09-01 09:15:01 | 46618.0 | -1,050 | initial_structure_stop |
+| 5 | 2 | 2026-09-01 09:26:33 | 2026-09-01 09:37:10 | 46787.0 | -1,240 | initial_structure_stop |
+| 6 | 1 | 2026-09-10 20:16:55 | 2026-09-10 20:32:21 | 46398.0 | 930 | one_r_target |
 
 ## 風險說明
 
-本版本依選定的 Legacy 行為，不會在獲利時移動停損，也沒有虧損上限。NT$400,000 僅作為權益基準；回測不會因權益或保證金不足自動平倉。
+NT$400,000 僅作為權益基準；回測不會因權益或保證金不足自動平倉。

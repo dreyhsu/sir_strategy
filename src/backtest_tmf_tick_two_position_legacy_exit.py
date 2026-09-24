@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import sys
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -28,7 +30,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
+DATA_DIR = ROOT / "data" / "txf"
 OUTPUT_DIR = ROOT / "txf_tick"
 DOC_DIR = ROOT / "doc"
 DEFAULT_START = date(2026, 8, 5)
@@ -131,6 +133,7 @@ def add_optimized_layer_signals(
     result["entry_layer"] = pd.NA
     result["resistance_reversal"] = False
     resistances = zones[zones["zone_type"] == "resistance"] if not zones.empty else zones
+    supports = zones[zones["zone_type"] == "support"] if not zones.empty else zones
 
     for session_id, session_bars in result.groupby("session_id", sort=False):
         session_hourly = hourly[hourly["session_id"] == session_id].sort_values("timestamp", kind="stable")
@@ -177,11 +180,11 @@ def add_optimized_layer_signals(
                     "high": float(bar["high"]), "age": 0,
                 })
 
+            # hourly_index already identifies the latest completed hour.  Do
+            # not rescan every earlier hourly row for every volume bar.
             atr_value = np.nan
-            if hourly_rows:
-                prior_hours = [h for h in hourly_rows if h.timestamp < bar["timestamp"]]
-                if prior_hours and hasattr(prior_hours[-1], "atr"):
-                    atr_value = float(prior_hours[-1].atr)
+            if hourly_index >= 0 and hasattr(hourly_rows[hourly_index], "atr"):
+                atr_value = float(hourly_rows[hourly_index].atr)
             buffer = 0.0 if pd.isna(atr_value) else breakout_buffer_atr * atr_value
 
             # Confirm a rejection only once, and expire stale candidates.
@@ -205,7 +208,6 @@ def add_optimized_layer_signals(
                 pending_rejections = [r for r in pending_rejections if r is not confirmed]
 
             # A support breakdown is a close-through event, not a touch.
-            supports = zones[zones["zone_type"] == "support"] if not zones.empty else zones
             if previous_close is not None and not supports.empty:
                 candidates = supports[
                     (supports["created_time"] < bar["timestamp"])
@@ -339,6 +341,7 @@ def backtest_two_position_short(
     scale_in_min_r: float = 0.5,
     confirmation_timeout_hours: float = 12.0,
     maximum_holding_hours: float = 24.0,
+    show_progress: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Run tick fills, two-lot scaling, a shared Supertrend exit, and account MTM."""
     if initial_capital_ntd <= 0 or max_positions < 1 or point_value_ntd <= 0:
@@ -348,14 +351,17 @@ def backtest_two_position_short(
 
     ordered_ticks = ticks.sort_values("tick_id", kind="stable").reset_index(drop=True)
     completed_bars = {int(row.tick_end_id): row for row in signal_bars.itertuples(index=False)}
+    hourly_columns = ["timestamp", "supertrend_direction"]
+    if "atr" in hourly.columns:
+        hourly_columns.append("atr")
     hourly_rows = list(
-        hourly[["timestamp", "supertrend_direction"]]
+        hourly[hourly_columns]
         .sort_values("timestamp", kind="stable")
         .itertuples(index=False)
     )
-    atr_rows = list(hourly.sort_values("timestamp", kind="stable").itertuples(index=False))
     hourly_index = -1
     current_direction: int | None = None
+    current_atr = np.nan
     group_last_direction: int | None = None
     group_seen_bearish = False
     next_group_id = 0
@@ -379,7 +385,24 @@ def backtest_two_position_short(
     next_sample_time: pd.Timestamp | None = None
     last_tick: object | None = None
 
-    for tick in ordered_ticks.itertuples(index=False):
+    total_ticks = len(ordered_ticks)
+    progress_started = time.monotonic()
+    progress_step = max(1, total_ticks // (100 if sys.stderr.isatty() else 20))
+
+    for tick_number, tick in enumerate(ordered_ticks.itertuples(index=False), start=1):
+        report_interval = tick_number % progress_step == 0 and tick_number / total_ticks < 0.995
+        if show_progress and (tick_number == 1 or report_interval or tick_number == total_ticks):
+            elapsed = time.monotonic() - progress_started
+            percent = tick_number / total_ticks * 100 if total_ticks else 100.0
+            if tick_number == 1:
+                message = f"Backtest ticks: {percent:5.1f}% ({tick_number:,}/{total_ticks:,})"
+            else:
+                eta = elapsed * (total_ticks - tick_number) / tick_number
+                message = (
+                    f"Backtest ticks: {percent:5.1f}% ({tick_number:,}/{total_ticks:,}) "
+                    f"elapsed {elapsed:,.0f}s, ETA {eta:,.0f}s"
+                )
+            print(message, file=sys.stderr, flush=True)
         last_tick = tick
         if previous_time is not None:
             elapsed = max(0.0, (tick.timestamp - previous_time).total_seconds())
@@ -387,11 +410,13 @@ def backtest_two_position_short(
         previous_time = tick.timestamp
 
         bullish_flip = False
-        current_atr = np.nan
         while hourly_index + 1 < len(hourly_rows) and hourly_rows[hourly_index + 1].timestamp < tick.timestamp:
             hourly_index += 1
-            direction_value = hourly_rows[hourly_index].supertrend_direction
+            hourly_row = hourly_rows[hourly_index]
+            direction_value = hourly_row.supertrend_direction
             new_direction = None if pd.isna(direction_value) else int(direction_value)
+            atr_value = getattr(hourly_row, "atr", np.nan)
+            current_atr = np.nan if pd.isna(atr_value) else float(atr_value)
             if positions and new_direction is not None:
                 if new_direction == -1:
                     group_seen_bearish = True
@@ -399,9 +424,6 @@ def backtest_two_position_short(
                     bullish_flip = True
                 group_last_direction = new_direction
             current_direction = new_direction
-        prior_atr = [row for row in atr_rows if row.timestamp < tick.timestamp]
-        if prior_atr and hasattr(prior_atr[-1], "atr") and not pd.isna(prior_atr[-1].atr):
-            current_atr = float(prior_atr[-1].atr)
 
         exited_this_tick = False
         if positions and bullish_flip:
@@ -842,6 +864,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-trades-output", type=Path, default=DEFAULT_GROUP_TRADES)
     parser.add_argument("--chart-output", type=Path, default=DEFAULT_CHART)
     parser.add_argument("--report-output", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="Hide stage messages and tick-loop percentage/ETA output.",
+    )
     args = parser.parse_args()
     if args.end_date < args.start_date:
         parser.error("--end-date must be on or after --start-date")
@@ -869,10 +895,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    show_progress = not args.no_progress
+
+    def stage(number: int, message: str) -> None:
+        if show_progress:
+            print(f"[{number}/8] {message}", file=sys.stderr, flush=True)
+
+    stage(1, "Finding daily source files...")
     sources = discover_daily_sources(args.input_dir, args.start_date, args.end_date)
     if not sources:
         raise ValueError("No matching Daily_YYYY_MM_DD.csv or .zip files were found.")
+    stage(2, f"Loading and filtering {len(sources)} daily files...")
     ticks = prepare_ticks(add_sessions(load_daily_ticks(sources, args.product.strip(), args.contract_month.strip())))
+    stage(3, f"Building hourly bars from {len(ticks):,} ticks...")
     hourly = build_hourly_bars(ticks)
     hourly = add_adaptive_supertrend(
         hourly, args.atr_length, args.base_multiplier, args.min_multiplier, args.speed_lookback,
@@ -881,22 +916,28 @@ def main() -> None:
     zones = pine_style_zones(
         hourly, args.pivot_lookback, args.volume_filter_length, args.zone_atr_length, args.zone_box_width
     )
+    stage(4, "Building session volume bars...")
     signal_bars = build_session_volume_bars(ticks, args.volume_bar_size)
+    stage(5, f"Detecting signals in {len(signal_bars):,} volume bars...")
     signal_bars = add_optimized_layer_signals(
         signal_bars, hourly, zones, args.close_position_max,
         args.breakout_buffer_atr, args.rejection_timeout_bars,
     )
+    stage(6, f"Running tick backtest across {len(ticks):,} ticks...")
     contracts, groups, samples, summary = backtest_two_position_short(
         ticks, signal_bars, hourly, args.initial_capital_ntd, args.max_positions, args.point_value_ntd,
         args.slippage_points, args.chart_sample_minutes,
         args.stop_buffer_atr, args.trail_atr_multiplier, args.scale_in_min_r,
         args.confirmation_timeout_hours, args.maximum_holding_hours,
+        show_progress=show_progress,
     )
+    stage(7, "Writing trade files and report...")
     for output in (args.contract_trades_output, args.group_trades_output):
         output.parent.mkdir(parents=True, exist_ok=True)
     contracts.to_csv(args.contract_trades_output, index=False, encoding="utf-8-sig")
     groups.to_csv(args.group_trades_output, index=False, encoding="utf-8-sig")
     write_report(args.report_output, args, sources, ticks, hourly, signal_bars, contracts, groups, summary)
+    stage(8, "Writing interactive chart...")
     write_chart(args.chart_output, zones, contracts, samples, args.initial_capital_ntd)
     print(
         f"ticks={len(ticks)} hourly_bars={len(hourly)} volume_bars={len(signal_bars)} "
@@ -907,6 +948,7 @@ def main() -> None:
         f"net_ntd={summary['net_ntd']:.0f} final_equity_ntd={summary['final_equity_ntd']:.0f}"
     )
     print(f"report={args.report_output}")
+    print(f"chart={args.chart_output}")
 
 
 if __name__ == "__main__":
