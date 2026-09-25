@@ -99,6 +99,38 @@ entry_price  = 下一根三分 K open + 空單滑價
 
 若 SELL 3m K 是同一 session 的最後一根，訊號取消，不保留到下一 session。
 
+### 5.3 壓力區向下脫離後的補進場
+
+若壓力區自確認以來**從未觸發過任何 initial_entry**（包含 in-zone 與本節的補進場），一旦價格向下脫離區間，下一次 UT Bot SELL 仍視為首次進場：
+
+```text
+zone_had_initial_entry   = False   # 該壓力區從未成交過首次進場
+zone_price_touched       = False   # 壓力區是否曾被價格觸及
+zone_downside_exit_seen  = False   # 是否已出現向下脫離
+
+每根已完成 3m K（zone 有效期間，尚未有 initial_entry）:
+  若 high >= resistance_bottom → zone_price_touched = True
+  若 zone_price_touched 且 close < resistance_bottom → zone_downside_exit_seen = True
+```
+
+- **必須先真的觸及壓力區**（3m high 達到或穿入 `resistance_bottom`）才可能標記「向下脫離」。
+- 若壓力區確認時價格早已在區下，且從未反彈觸及區間，本規則永遠不會啟用。
+
+進場條件（entry_type = `initial_entry_after_downside_exit`）：
+
+```text
+無持倉 且 非 reentry_armed
+且 zone_had_initial_entry == False
+且 zone_downside_exit_seen == True
+且 該 3m K 出現 ut_sell_signal
+```
+
+- close 位置不限制在區內，可以在區外任意位置成立。
+- 停損仍使用該壓力區的 `resistance_top`（原上蓋），因此 close 越低、`initial_risk` 越大。
+- 一旦以此規則成交（或任何 initial_entry 成交），`zone_had_initial_entry = True`，本規則在該壓力區之後不再啟用。
+- 若新壓力區覆蓋，`zone_had_initial_entry` 與 `zone_downside_exit_seen` 都在切區時重設為 False。
+- 出場、trailing、再進場邏輯不變；停損後的 `reentry_armed` 一樣要求突破原上蓋 + close 回原區。
+
 ## 6. 初始結構停損
 
 ```text
@@ -235,6 +267,7 @@ active_stop   = min(initial_stop, trailing_stop)
 | UT Bot | Source | 3m close (非 Heikin-Ashi) |
 | 進場 | Fill | Next 3m open |
 | 首次進場 | Trigger | UT Bot SELL 且 close ∈ 壓力區 |
+| 首次進場（補） | Trigger | 壓力區從未進場 + 已向下脫離 + UT Bot SELL |
 | 首次進場 | SMA / Supertrend filter | 不套用 |
 | 再進場 | 觀察窗 | 15 minutes |
 | 再進場 | Trigger | UT Bot SELL + close ∈ 原區 |
@@ -242,9 +275,9 @@ active_stop   = min(initial_stop, trailing_stop)
 | 初始停損 | Risk ATR length | 20 (hourly) |
 | 初始停損 | Buffer | 0.5 × hourly ATR(20) above top |
 | 追蹤停損 | Activation | 空頭確認 + 曾達 1R |
-| 追蹤停損 | ATR multiplier | 1.5 × hourly ATR(20) |
+| 追蹤停損 | ATR multiplier | 3.0 × hourly ATR(20) |
 | Adjust Supertrend | ATR length | 10 (hourly) |
-| Adjust Supertrend | Base / minimum multiplier | 3.0 / 0.8 |
+| Adjust Supertrend | Base / minimum multiplier | 4.5 / 1.5 |
 | Adjust Supertrend | Speed lookback | 2 |
 | Adjust Supertrend | Speed smoothing | 2 |
 | Adjust Supertrend | Low / high speed threshold | 0.25 / 0.8 |

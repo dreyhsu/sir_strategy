@@ -21,7 +21,9 @@ env/
 .DS_Store
 
 # Generated datasets and backtest outputs
-data/
+data/*
+# Keep the transformed BTCUSDT 1h/3m bars so they can be shared via GitHub
+!data/btcusdt_bars/
 txf_tick/
 btcusdt_tick/
 
