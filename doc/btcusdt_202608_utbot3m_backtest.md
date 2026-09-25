@@ -2,8 +2,8 @@
 
 ## Data & Setup
 
-- Backtest month: `2026-08` (UTC); warm-up months: none.
-- Hourly bars in span: 743; simulated 3m bars (target month): 14,879.
+- Backtest month: `2026-08` (UTC); warm-up months: 2026-07.
+- Hourly bars in span: 1,486; simulated 3m bars (target month): 14,879.
 - Costs: slippage `1` bps/side, taker fee `0.0400%`, size `1` BTC.
 - Pine resistance: close pivot `20/20`, volume filter `2`, ATR(200) × `1`.
 - Entry: 3m UT Bot(a=2, ATR=10) SELL with close inside the zone; short on next 3m open.
@@ -15,11 +15,11 @@
 
 | Item | Count |
 | --- | ---: |
-| Pine resistance IDs used | 4 |
-| Dynamic top versions | 4 |
+| Pine resistance IDs used | 6 |
+| Dynamic top versions | 6 |
 | Top adjustments | 0 |
-| Initial-entry signals | 3 |
-| Downside-exit initial signals | 1 |
+| Initial-entry signals | 7 |
+| Downside-exit initial signals | 3 |
 | Re-entry signals | 0 |
 | UT Bot SELL total | 474 |
 
@@ -27,28 +27,36 @@
 
 | Metric | Result |
 | --- | ---: |
-| Trades | 4 |
-| Wins / Losses / Breakeven | 0 / 4 / 0 |
-| Win rate | 0.0% |
-| Gross P&L | -965.07 USDT |
-| Net P&L after costs | -1,222.71 USDT |
-| Total fees | 206.11 USDT |
-| Net profit factor | 0.00 |
-| Average net P&L | -305.68 USDT |
-| Maximum net drawdown | -1,222.71 USDT |
+| Trades | 10 |
+| Wins / Losses / Breakeven | 1 / 9 / 0 |
+| Win rate | 10.0% |
+| Gross P&L | -1,547.19 USDT |
+| Net P&L after costs | -2,194.89 USDT |
+| Total fees | 518.16 USDT |
+| Net profit factor | 0.24 |
+| Average net P&L | -219.49 USDT |
+| Maximum net drawdown | -2,194.89 USDT |
 
 ## Exit Reasons
 
-- `initial_stop`: 4
+- `initial_stop`: 8
+- `atr_trailing_stop`: 1
+- `atr_trailing_stop_gap`: 1
 
 ## Trade Detail
 
 | # | Entry type | Entry | Exit | Net USDT | Net R | Exit reason |
 |---:|---|---|---|---:|---:|---|
-| 1 | initial_entry_after_downside_exit | 2026-08-17 17:30 @ 64163.4 | 2026-08-17 18:23 @ 64532.9 | -421.00 | -1.02 | initial_stop |
-| 2 | initial_entry | 2026-08-17 19:03 @ 64307.6 | 2026-08-17 23:32 @ 64542.7 | -286.66 | -1.03 | initial_stop |
-| 3 | initial_entry | 2026-08-18 06:51 @ 64281.2 | 2026-08-18 14:23 @ 64535.9 | -306.23 | -1.03 | initial_stop |
-| 4 | initial_entry | 2026-08-19 01:45 @ 64380.8 | 2026-08-19 12:35 @ 64538.0 | -208.83 | -1.04 | initial_stop |
+| 1 | initial_entry_after_downside_exit | 2026-08-05 20:57 @ 64802.3 | 2026-08-07 09:26 @ 64785.3 | -34.86 | 0.03 | atr_trailing_stop |
+| 2 | initial_entry_after_downside_exit | 2026-08-07 10:27 @ 64781.5 | 2026-08-07 12:56 @ 65317.4 | -587.96 | -1.01 | initial_stop |
+| 3 | initial_entry | 2026-08-07 13:57 @ 65002.6 | 2026-08-09 22:14 @ 65321.0 | -370.50 | -1.02 | initial_stop |
+| 4 | initial_entry | 2026-08-10 00:24 @ 65004.7 | 2026-08-10 01:50 @ 65265.7 | -313.08 | -1.03 | initial_stop |
+| 5 | initial_entry | 2026-08-10 02:09 @ 65048.4 | 2026-08-10 06:56 @ 65283.9 | -287.65 | -1.03 | initial_stop |
+| 6 | initial_entry | 2026-08-10 12:15 @ 65094.0 | 2026-08-11 11:03 @ 64356.4 | 685.77 | 3.89 | atr_trailing_stop_gap |
+| 7 | initial_entry_after_downside_exit | 2026-08-17 17:30 @ 64163.4 | 2026-08-17 18:23 @ 64548.9 | -436.97 | -1.02 | initial_stop |
+| 8 | initial_entry | 2026-08-17 19:03 @ 64307.6 | 2026-08-17 23:59 @ 64558.7 | -302.63 | -1.03 | initial_stop |
+| 9 | initial_entry | 2026-08-18 06:51 @ 64281.2 | 2026-08-18 14:23 @ 64551.8 | -322.20 | -1.02 | initial_stop |
+| 10 | initial_entry | 2026-08-19 01:45 @ 64380.8 | 2026-08-19 12:35 @ 64554.0 | -224.81 | -1.04 | initial_stop |
 
 ## Notes
 
