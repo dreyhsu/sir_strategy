@@ -151,6 +151,11 @@ def backtest_strategy(
     trailing_atr: float = 3.0,
     top_adjust_ratio: float = 0.5,
     reentry_timeout_minutes: int = 15,
+    breakout_invalidate_atr: float = 1.5,
+    max_uptrend_slope: float = 0.5,
+    approach_atr: float = 0.25,
+    max_entry_below_atr: float = 1.5,
+    stop_swing_lookback: int = 20,
     slippage_bps: float = 1.0,
     taker_fee_rate: float = 0.0004,
     position_btc: float = 1.0,
@@ -160,8 +165,10 @@ def backtest_strategy(
     Identical entry/exit logic; only the fill/cost accounting is Binance-perp
     (slippage bps + taker fee, entry fill raised, exit fill raised).
     """
-    if min(initial_stop_atr, trailing_atr, slippage_bps, taker_fee_rate, position_btc) < 0:
+    if min(initial_stop_atr, trailing_atr, breakout_invalidate_atr, approach_atr, max_entry_below_atr, slippage_bps, taker_fee_rate, position_btc) < 0:
         raise ValueError("ATR multipliers, slippage, fee, and size must be non-negative")
+    if stop_swing_lookback < 1:
+        raise ValueError("stop_swing_lookback must be positive")
     if not 0 <= top_adjust_ratio <= 1:
         raise ValueError("top_adjust_ratio must be between 0 and 1")
     if reentry_timeout_minutes < 1:
@@ -169,10 +176,12 @@ def backtest_strategy(
 
     slip = slippage_bps / 10_000.0
     frame = bar_frame.copy().sort_values("timestamp", kind="stable").reset_index(drop=True)
+    frame["recent_high"] = frame["high"].rolling(stop_swing_lookback, min_periods=1).max()
     for column, default in (
         ("active_zone_id", pd.NA), ("zone_version", pd.NA), ("dynamic_resistance_bottom", np.nan),
         ("dynamic_resistance_top", np.nan), ("entry_signal", False), ("entry_signal_type", None),
         ("top_adjusted", False), ("breakout_peak", np.nan), ("breakout_deadline", pd.NaT),
+        ("zone_invalidated", False),
     ):
         frame[column] = default
     frame["active_zone_id"] = frame["active_zone_id"].astype("Int64")
@@ -198,6 +207,7 @@ def backtest_strategy(
     zone_had_initial_entry = False
     zone_downside_exit_seen = False
     zone_price_touched = False
+    zone_invalidated = False
 
     def close_zone_segment(end_time: pd.Timestamp) -> None:
         if zone_id is not None and zone_start is not None:
@@ -236,6 +246,7 @@ def backtest_strategy(
             zone_had_initial_entry = False
             zone_downside_exit_seen = False
             zone_price_touched = False
+            zone_invalidated = False
 
         occupied_at_open = position is not None
         stopped_this_bar = False
@@ -243,12 +254,16 @@ def backtest_strategy(
         current_direction = None if pd.isna(bar["adjust_supertrend_direction"]) else int(bar["adjust_supertrend_direction"])
 
         if position is not None:
-            active_stop = min(
-                position.initial_stop,
-                position.trailing_stop if position.trailing_stop is not None else position.initial_stop,
-            )
+            trailing = position.trailing_stop if position.trailing_stop is not None else np.inf
+            breakeven = position.breakeven_stop if position.breakeven_stop is not None else np.inf
+            active_stop = min(position.initial_stop, trailing, breakeven)
             if raw_open >= active_stop:
-                reason = "atr_trailing_stop_gap" if position.trailing_stop is not None and active_stop < position.initial_stop else "initial_stop_gap"
+                if position.profit_locked and breakeven <= trailing and breakeven <= position.initial_stop:
+                    reason = "breakeven_lock_gap"
+                elif position.trailing_stop is not None and active_stop < position.initial_stop:
+                    reason = "atr_trailing_stop_gap"
+                else:
+                    reason = "initial_stop_gap"
                 position.highest_price = max(position.highest_price, raw_open)
                 trades.append(record(position, bar, bar_start, raw_open, reason))
                 if reason == "initial_stop_gap":
@@ -279,7 +294,11 @@ def backtest_strategy(
                 raw_entry = raw_open
                 entry_fill = raw_entry * (1 - slip)
                 entry_top = float(pending_entry.get("adjusted_resistance_top", pending_entry["resistance_top"]))
-                initial_stop = entry_top + initial_stop_atr * float(pending_entry["risk_atr"])
+                stop_ref = entry_top
+                swing_high = float(pending_entry.get("swing_high", np.nan))
+                if pd.notna(swing_high) and entry_fill < swing_high < entry_top:
+                    stop_ref = swing_high
+                initial_stop = stop_ref + initial_stop_atr * float(pending_entry["risk_atr"])
                 initial_risk = initial_stop - entry_fill
                 if initial_risk > 0 and entry_fill < initial_stop:
                     entry_zone_version = int(pending_entry["zone_version"])
@@ -326,13 +345,16 @@ def backtest_strategy(
                 position.supertrend_confirmed = True
             if current_direction is not None:
                 position.last_supertrend_direction = current_direction
-            active_stop = min(
-                position.initial_stop,
-                position.trailing_stop if position.trailing_stop is not None else position.initial_stop,
-            )
+            trailing = position.trailing_stop if position.trailing_stop is not None else np.inf
+            breakeven = position.breakeven_stop if position.breakeven_stop is not None else np.inf
+            active_stop = min(position.initial_stop, trailing, breakeven)
             if float(bar["high"]) >= active_stop:
-                trailing_is_active = position.trailing_stop is not None and active_stop < position.initial_stop
-                reason = "atr_trailing_stop" if trailing_is_active else "initial_stop"
+                if position.profit_locked and breakeven <= trailing and breakeven <= position.initial_stop:
+                    reason = "breakeven_lock"
+                elif position.trailing_stop is not None and active_stop < position.initial_stop:
+                    reason = "atr_trailing_stop"
+                else:
+                    reason = "initial_stop"
                 position.highest_price = max(position.highest_price, active_stop)
                 trades.append(record(position, bar, timestamp, active_stop, reason))
                 if reason == "initial_stop":
@@ -347,6 +369,14 @@ def backtest_strategy(
             else:
                 position.lowest_price = min(position.lowest_price, float(bar["low"]))
                 position.highest_price = max(position.highest_price, float(bar["high"]))
+                if not position.profit_locked and (
+                    (position.entry_price >= position.resistance_bottom and position.lowest_price < position.resistance_bottom)
+                    or position.entry_price - position.lowest_price >= position.initial_risk
+                ):
+                    position.profit_locked = True
+                    position.breakeven_stop = (
+                        position.entry_price * (1 - taker_fee_rate) / ((1 + taker_fee_rate) * (1 + slip))
+                    )
                 if not position.reached_one_r and position.entry_price - position.lowest_price >= position.initial_risk:
                     position.reached_one_r = True
                     position.one_r_time = timestamp
@@ -386,8 +416,20 @@ def backtest_strategy(
             elif breakout_armed and float(bar["high"]) > zone_top:
                 breakout_peak = max(float(breakout_peak), float(bar["high"]))
 
+        if zone_id is not None and not zone_invalidated and pd.notna(bar["risk_atr"]):
+            if float(bar["close"]) > zone_top + breakout_invalidate_atr * float(bar["risk_atr"]):
+                zone_invalidated = True
+                reentry_armed = False
+                reentry_zone_id = None
+                breakout_armed = False
+                breakout_peak = np.nan
+                breakout_start_time = None
+                breakout_expired = False
+                pending_entry = None
+
         if zone_id is not None and not zone_had_initial_entry:
-            if not zone_price_touched and float(bar["high"]) >= zone_bottom:
+            approach_band = approach_atr * float(bar["risk_atr"]) if pd.notna(bar["risk_atr"]) else 0.0
+            if not zone_price_touched and float(bar["high"]) >= zone_bottom - approach_band:
                 zone_price_touched = True
             if zone_price_touched and float(bar["close"]) < zone_bottom:
                 zone_downside_exit_seen = True
@@ -398,7 +440,9 @@ def backtest_strategy(
             and not occupied_at_open
             and not stopped_this_bar
             and zone_id is not None
+            and not zone_invalidated
             and pd.notna(bar["risk_atr"])
+            and (pd.isna(bar["uptrend_slope"]) or float(bar["uptrend_slope"]) <= max_uptrend_slope)
             and index < len(frame) - 1
             and bool(bar["ut_sell_signal"])
         ):
@@ -418,7 +462,11 @@ def backtest_strategy(
             elif not reentry_armed:
                 if in_zone:
                     entry_type = "initial_entry"
-                elif zone_downside_exit_seen and not zone_had_initial_entry:
+                elif (
+                    zone_downside_exit_seen
+                    and not zone_had_initial_entry
+                    and bar_close >= zone_bottom - max_entry_below_atr * float(bar["risk_atr"])
+                ):
                     entry_type = "initial_entry_after_downside_exit"
             if entry_type is not None:
                 frame.at[index, "entry_signal"] = True
@@ -432,6 +480,7 @@ def backtest_strategy(
                     "resistance_bottom": zone_bottom,
                     "resistance_top": zone_top,
                     "risk_atr": float(bar["risk_atr"]),
+                    "swing_high": float(bar["recent_high"]),
                 }
                 if entry_type == "reentry_after_initial_stop":
                     pending_entry["adjusted_resistance_top"] = adjusted_resistance_top(
@@ -447,6 +496,7 @@ def backtest_strategy(
             frame.at[index, "zone_version"] = zone_version
             frame.at[index, "dynamic_resistance_bottom"] = zone_bottom
             frame.at[index, "dynamic_resistance_top"] = zone_top
+            frame.at[index, "zone_invalidated"] = zone_invalidated
             if breakout_armed:
                 frame.at[index, "breakout_peak"] = breakout_peak
                 frame.at[index, "breakout_deadline"] = (
@@ -533,8 +583,13 @@ def write_markdown_report(
 - Costs: slippage `{args.slippage_bps:g}` bps/side, taker fee `{args.taker_fee_rate:.4%}`, size `{args.position_btc:g}` BTC.
 - Pine resistance: close pivot `{args.pivot_lookback}/{args.pivot_lookback}`, volume filter `{args.volume_filter_length}`, ATR({args.box_atr_length}) × `{args.box_width:g}`.
 - Entry: 3m UT Bot(a={args.ut_sensitivity:g}, ATR={args.ut_atr_period}) SELL with close inside the zone; short on next 3m open.
-- Initial stop: zone top + `{args.initial_stop_atr:g} × hourly ATR({args.risk_atr_length})`.
+- Initial stop: min(zone top, recent {args.stop_swing_lookback}-bar swing high) + `{args.initial_stop_atr:g} × hourly ATR({args.risk_atr_length})` — anchored to the rejection high, not just the box top.
+- Downside-exit entries only when the close is within `{args.max_entry_below_atr:g} × hourly ATR({args.risk_atr_length})` below the zone bottom (no shorting far under the zone).
 - Re-entry only after an initial stop; break above top then a UT Bot SELL back inside the zone within `{args.reentry_timeout_minutes}` min.
+- Profit lock: once price trades below the zone bottom OR the trade reaches 1R, the stop ratchets to break-even net of round-trip fees (`breakeven_lock`), so a profitable short can't turn into a net loss.
+- Resistance retired (no more shorts) once a 3m close clears the zone top by more than `{args.breakout_invalidate_atr:g} × hourly ATR({args.risk_atr_length})` — a full breakout, role reversal to support.
+- Trend filter: no new shorts while the hourly SMA({args.trend_sma_length}) is rising faster than `{args.max_uptrend_slope:g}%` over `{args.trend_slope_hours}h` (stand aside in strong uptrends).
+- Approach band: price counts as reaching the zone when the high comes within `{args.approach_atr:g} × hourly ATR({args.risk_atr_length})` of the bottom (captures rejections just under resistance).
 - Adjust Supertrend dynamic multiplier `{args.base_multiplier:g}–{args.minimum_multiplier:g}`; short-confirmed + 1R reached enables `{args.trailing_atr:g} × ATR({args.risk_atr_length})` trailing.
 
 ## Signals & Structure
@@ -544,6 +599,7 @@ def write_markdown_report(
 | Pine resistance IDs used | {int(zones['zone_id'].nunique()) if not zones.empty else 0} |
 | Dynamic top versions | {len(zones)} |
 | Top adjustments | {int(bars['top_adjusted'].sum())} |
+| Zones invalidated (full breakout) | {int(bars.loc[bars['zone_invalidated'], 'active_zone_id'].nunique())} |
 | Initial-entry signals | {int((bars['entry_signal_type'] == 'initial_entry').sum())} |
 | Downside-exit initial signals | {int((bars['entry_signal_type'] == 'initial_entry_after_downside_exit').sum())} |
 | Re-entry signals | {int((bars['entry_signal_type'] == 'reentry_after_initial_stop').sum())} |
@@ -717,9 +773,15 @@ def run_month(month: str, args: argparse.Namespace) -> dict[str, object]:
         args.speed_lookback, args.speed_smoothing, args.base_multiplier,
         args.minimum_multiplier, args.low_speed, args.high_speed,
     )
+    hourly = hourly.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    trend_sma = hourly["close"].rolling(args.trend_sma_length).mean()
+    hourly["uptrend_slope"] = (trend_sma / trend_sma.shift(args.trend_slope_hours) - 1.0) * 100.0
     bars = load_span(args.bars_dir, span_months, "3m")
     bars = add_ut_bot_state(bars, sensitivity=args.ut_sensitivity, atr_period=args.ut_atr_period)
     bars = attach_hourly_features(bars, hourly)
+    bars["uptrend_slope"] = bars["hourly_confirmation_time"].map(
+        hourly.set_index("timestamp")["uptrend_slope"]
+    )
 
     month_period = pd.Period(month, freq="M")
     month_start = pd.Timestamp(month_period.start_time, tz="UTC")
@@ -731,7 +793,9 @@ def run_month(month: str, args: argparse.Namespace) -> dict[str, object]:
 
     trades, bar_state, zone_segments = backtest_strategy(
         month_bars, args.initial_stop_atr, args.trailing_atr, args.top_adjust_ratio,
-        args.reentry_timeout_minutes, args.slippage_bps, args.taker_fee_rate, args.position_btc,
+        args.reentry_timeout_minutes, args.breakout_invalidate_atr, args.max_uptrend_slope,
+        args.approach_atr, args.max_entry_below_atr, args.stop_swing_lookback,
+        args.slippage_bps, args.taker_fee_rate, args.position_btc,
     )
     summary = performance_summary(trades)
     hourly_month = hourly[(hourly["timestamp"] >= month_start) & (hourly["timestamp"] <= month_end)]
@@ -784,6 +848,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trailing-atr", type=float, default=3.0)
     parser.add_argument("--top-adjust-ratio", type=float, default=0.5)
     parser.add_argument("--reentry-timeout-minutes", type=int, default=15)
+    parser.add_argument("--breakout-invalidate-atr", type=float, default=1.5)
+    parser.add_argument("--trend-sma-length", type=int, default=100)
+    parser.add_argument("--trend-slope-hours", type=int, default=24)
+    parser.add_argument("--max-uptrend-slope", type=float, default=0.5)
+    parser.add_argument("--approach-atr", type=float, default=0.25)
+    parser.add_argument("--max-entry-below-atr", type=float, default=1.5)
+    parser.add_argument("--stop-swing-lookback", type=int, default=20)
     parser.add_argument("--slippage-bps", type=float, default=1.0)
     parser.add_argument("--taker-fee-rate", type=float, default=0.0004)
     parser.add_argument("--position-btc", type=float, default=1.0)
@@ -795,12 +866,13 @@ def parse_args() -> argparse.Namespace:
     positive_lengths = (
         args.pivot_lookback, args.volume_filter_length, args.box_atr_length, args.risk_atr_length,
         args.adjust_atr_length, args.speed_lookback, args.speed_smoothing, args.ut_atr_period,
+        args.trend_sma_length, args.trend_slope_hours, args.stop_swing_lookback,
     )
     if min(positive_lengths) < 1:
         parser.error("all lengths must be positive")
     if args.ut_sensitivity <= 0:
         parser.error("--ut-sensitivity must be positive")
-    if min(args.box_width, args.initial_stop_atr, args.trailing_atr, args.slippage_bps, args.taker_fee_rate, args.position_btc) < 0:
+    if min(args.box_width, args.initial_stop_atr, args.trailing_atr, args.breakout_invalidate_atr, args.approach_atr, args.max_entry_below_atr, args.slippage_bps, args.taker_fee_rate, args.position_btc) < 0:
         parser.error("width, ATR multipliers, slippage, fee, and size must be non-negative")
     if not 0 <= args.top_adjust_ratio <= 1:
         parser.error("--top-adjust-ratio must be between 0 and 1")

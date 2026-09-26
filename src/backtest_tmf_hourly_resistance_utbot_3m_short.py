@@ -34,8 +34,8 @@ DEFAULT_INPUT_DIR = ROOT / "data" / "txf"
 DEFAULT_OUTPUT_DIR = ROOT / "txf_tick"
 DEFAULT_DOC_DIR = ROOT / "doc"
 DEFAULT_START = date(2026, 8, 5)
-DEFAULT_END = date(2026, 9, 15)
-DEFAULT_PERIOD = "2026-08-05_to_2026-09-15"
+DEFAULT_END = date(2026, 9, 29)
+DEFAULT_PERIOD = "2026-08-05_to_2026-09-29"
 BAR_MINUTES = 3
 
 
@@ -61,6 +61,8 @@ class Position:
     reached_one_r: bool = False
     one_r_time: pd.Timestamp | None = None
     trailing_stop: float | None = None
+    profit_locked: bool = False
+    breakeven_stop: float | None = None
 
 
 TRADE_COLUMNS = [
