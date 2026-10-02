@@ -22,8 +22,8 @@ from urllib.request import Request, urlopen
 
 
 SYMBOL = "BTCUSDT"
-START_MONTH = "2026-01"
-END_MONTH = "2026-08"
+START_MONTH = "2025-01"
+END_MONTH = "2025-12"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "data" / "btcusdt"
 USER_AGENT = "TXF-analysis Binance archive downloader/1.0"
 
