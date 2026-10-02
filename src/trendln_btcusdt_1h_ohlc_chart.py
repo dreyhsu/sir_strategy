@@ -121,11 +121,28 @@ def _lines_from_trend(trend, timestamps: pd.Series, kind: str) -> list[dict]:
                 "slope": slope,
                 "intercept": intercept,
                 "corr": corr,
+                "n_points": len(idxs),
                 "idx0": x0,
                 "idx1": x1,
             }
         )
     return lines
+
+
+def select_top_lines(lines: list[dict], max_lines: int) -> list[dict]:
+    """Keep the ``max_lines`` most significant lines (``0`` or negative = keep all).
+
+    Significance = number of swing points the line touches (desc), tie-broken by
+    absolute fit correlation (desc).
+    """
+    if max_lines is None or max_lines <= 0:
+        return lines
+    ranked = sorted(
+        lines,
+        key=lambda ln: (ln.get("n_points", 2), abs(ln.get("corr", 0.0))),
+        reverse=True,
+    )
+    return ranked[:max_lines]
 
 
 def _bestfit_line(bestfit, timestamps: pd.Series, kind: str) -> dict | None:
@@ -160,10 +177,14 @@ def compute_trendlines(
     *,
     window: int = 125,
     accuracy: int = 2,
+    max_lines: int = 0,
     extmethod=trendln.METHOD_NAIVECONSEC,
     method=trendln.METHOD_NSQUREDLOGN,
 ) -> dict:
     """Compute support/resistance trendlines for ``frame`` using trendln.
+
+    ``max_lines`` caps how many trendlines are kept per side (``0`` = keep all),
+    selecting the most significant ones (see :func:`select_top_lines`).
 
     Returns a dict with ``support``/``resistance`` lists of line dicts and
     ``support_bestfit``/``resistance_bestfit`` single line dicts (or ``None``).
@@ -183,8 +204,12 @@ def compute_trendlines(
     _, bestfit_max, maxtrend, _ = resistance
 
     return {
-        "support": _lines_from_trend(mintrend, timestamps, "support"),
-        "resistance": _lines_from_trend(maxtrend, timestamps, "resistance"),
+        "support": select_top_lines(
+            _lines_from_trend(mintrend, timestamps, "support"), max_lines
+        ),
+        "resistance": select_top_lines(
+            _lines_from_trend(maxtrend, timestamps, "resistance"), max_lines
+        ),
         "support_bestfit": _bestfit_line(bestfit_min, timestamps, "support"),
         "resistance_bestfit": _bestfit_line(bestfit_max, timestamps, "resistance"),
     }
@@ -208,8 +233,8 @@ def _add_line_group(
                 x=[line["x0"], line["x1"]],
                 y=[line["y0"], line["y1"]],
                 mode="lines",
-                line=dict(color=color, width=1),
-                opacity=0.35,
+                line=dict(color=color, width=1.4),
+                opacity=0.6,
                 legendgroup=group,
                 name=name,
                 showlegend=first,
@@ -319,6 +344,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=125)
     parser.add_argument("--accuracy", type=int, default=2)
     parser.add_argument(
+        "--max-lines",
+        type=int,
+        default=6,
+        help="max trendlines drawn per side (0 = all); keeps the most significant",
+    )
+    parser.add_argument(
         "--extmethod",
         choices=sorted(EXTMETHODS),
         default="naiveconsec",
@@ -355,6 +386,7 @@ def main(argv: list[str] | None = None) -> None:
         frame,
         window=args.window,
         accuracy=args.accuracy,
+        max_lines=args.max_lines,
         extmethod=EXTMETHODS[args.extmethod],
     )
 
