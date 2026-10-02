@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Convert raw Binance BTCUSDT aggTrades CSVs into committed 1h and 3m bar CSVs.
+"""Convert raw Binance BTCUSDT aggTrades CSVs into committed 1h, 15m and 3m bar CSVs.
 
 The raw monthly aggTrades files are huge (tens of millions of rows). This script
-streams each month once and writes compact 1-hour and 3-minute OHLCV bars to
-``data/btcusdt_bars/`` so they can be committed to git, pulled to another machine,
-and used for backtesting and parameter tuning without ever re-touching the ticks.
+streams each month once and writes compact 1-hour, 15-minute and 3-minute OHLCV
+bars to ``data/btcusdt_bars/`` so they can be committed to git, pulled to another
+machine, and used for backtesting and parameter tuning without ever re-touching the
+ticks.
 
 Bars are UTC bucket-anchored and the unconfirmed final bucket of each month is
 dropped, matching ``build_time_bars`` in the existing BTC backtests. BTCUSDT is a
@@ -53,6 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_DIR = ROOT / "data" / "btcusdt"
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "btcusdt_bars"
 HOURLY_MINUTES = 60
+FIFTEEN_MINUTES = 15
 THREE_MINUTES = 3
 
 
@@ -127,20 +129,22 @@ class _BarAccumulator:
         return pd.DataFrame(self.records)
 
 
-def build_month_bars(path: Path, progress_rows: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Stream one month of aggTrades once and return (hourly, three_minute) bars."""
+def build_month_bars(path: Path, progress_rows: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Stream one month of aggTrades once and return (hourly, fifteen_minute, three_minute) bars."""
     hourly = _BarAccumulator(HOURLY_MINUTES)
+    fifteen_minute = _BarAccumulator(FIFTEEN_MINUTES)
     three_minute = _BarAccumulator(THREE_MINUTES)
     rows = 0
     for price, quantity, timestamp_ms in iter_agg_trades([path]):
         hourly.add(price, quantity, timestamp_ms)
+        fifteen_minute.add(price, quantity, timestamp_ms)
         three_minute.add(price, quantity, timestamp_ms)
         rows += 1
         if progress_rows and rows % progress_rows == 0:
             print(f"  {path.name}: streamed {rows:,} aggTrades")
     if rows == 0:
         raise ValueError(f"{path} contained no aggTrades")
-    return hourly.to_frame(), three_minute.to_frame()
+    return hourly.to_frame(), fifteen_minute.to_frame(), three_minute.to_frame()
 
 
 def write_bars(frame: pd.DataFrame, path: Path, minute_column: str) -> None:
@@ -170,8 +174,14 @@ def main() -> None:
     built = 0
     for month in months:
         hourly_path = output_dir / f"BTCUSDT_{month}_1h.csv"
+        fifteen_minute_path = output_dir / f"BTCUSDT_{month}_15m.csv"
         three_minute_path = output_dir / f"BTCUSDT_{month}_3m.csv"
-        if hourly_path.is_file() and three_minute_path.is_file() and not args.overwrite:
+        if (
+            hourly_path.is_file()
+            and fifteen_minute_path.is_file()
+            and three_minute_path.is_file()
+            and not args.overwrite
+        ):
             print(f"{month}: bars already exist; skipping (use --overwrite to rebuild)")
             continue
         source = resolve_month_input(input_dir, month)
@@ -179,10 +189,14 @@ def main() -> None:
             print(f"{month}: no BTCUSDT-aggTrades-{month}.csv in {input_dir}; skipping")
             continue
         print(f"{month}: building bars from {source.name}")
-        hourly, three_minute = build_month_bars(source, args.progress_rows)
+        hourly, fifteen_minute, three_minute = build_month_bars(source, args.progress_rows)
         write_bars(hourly, hourly_path, "hour_start")
+        write_bars(fifteen_minute, fifteen_minute_path, "minute_start")
         write_bars(three_minute, three_minute_path, "minute_start")
-        print(f"{month}: wrote {len(hourly):,} hourly and {len(three_minute):,} 3m bars")
+        print(
+            f"{month}: wrote {len(hourly):,} hourly, {len(fifteen_minute):,} 15m "
+            f"and {len(three_minute):,} 3m bars"
+        )
         built += 1
     print(f"done: built {built} month(s)")
 
