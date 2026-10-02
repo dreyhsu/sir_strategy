@@ -42,8 +42,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BARS_DIR = ROOT / "data" / "btcusdt_bars"
 DEFAULT_OUTPUT_DIR = ROOT / "btcusdt_tick"
 DEFAULT_DOC_DIR = ROOT / "doc"
-DEFAULT_START_MONTH = "2026-02"
-DEFAULT_END_MONTH = "2026-08"
+DEFAULT_START_MONTH = "2025-02"
+DEFAULT_END_MONTH = "2025-08"
 
 
 @dataclass

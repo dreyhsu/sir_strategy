@@ -157,7 +157,7 @@ def write_bars(frame: pd.DataFrame, path: Path, minute_column: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-month", type=parse_month, default="2026-01")
+    parser.add_argument("--start-month", type=parse_month, default="2025-01")
     parser.add_argument("--end-month", type=parse_month, default="2026-08")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
