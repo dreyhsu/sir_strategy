@@ -758,6 +758,15 @@ def write_html_report(
             close=bars["close"], name="BTCUSDT 15m",
         ), row=1, col=1,
     )
+    # Last-closed 1h MA(20), stepped across the 15m bars it governs.
+    if "hourly_ma" in bars.columns:
+        figure.add_trace(
+            go.Scatter(
+                x=bars["timestamp"], y=bars["hourly_ma"], mode="lines", name="1h MA20",
+                line={"color": "#fb8c00", "width": 1.6, "shape": "hv"},
+                hovertemplate="1h MA20<br>%{x}<br>%{y:.1f}<extra></extra>",
+            ), row=1, col=1,
+        )
     # Every drawn trend line, coloured by outcome.
     status_color = {"entered": "#2e7d32", "unresolved": "#90a4ae", "death_cross": "#8d6e63"}
     legend_seen: set[str] = set()
